@@ -135,7 +135,7 @@ Detailed metrics and plots are available in the `training_figures*/` directories
 ## Author
 
 Saskia Knight  
-MSci Physics, Imperial College London
+MSci Physics, Imperial College London \
 Date: 2026
 
 ## Acknowledgments
