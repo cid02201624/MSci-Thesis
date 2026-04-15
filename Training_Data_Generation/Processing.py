@@ -1,54 +1,38 @@
 """
 Author: Saskia Knight
 Date: January 2026
-Description: 
-1. Find the GPS times when data is good quality, has no events, and is available for both H1 and L1. 
-2. Randomly select segments within approved times, download strain data, process and add injections.
+Description: Fetches real noise according to sampling list and generates simulated signals and glitches.
+Then preprocesses data and puts it in a suitable formatfor training.
+
 """
 
 # Basics
 from __future__ import annotations
-from multiprocessing.util import debug
+from functools import lru_cache
+import os, json, time, random, glob
+from requests.exceptions import RequestException, HTTPError, Timeout, ConnectionError
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, iirnotch, tf2sos, sosfiltfilt
-from functools import lru_cache
-import os
-from pathlib import Path
-import json
 
 # GW Related
 from gwpy.timeseries import TimeSeries
+from pycbc.filter import sigma
+from pycbc.psd import interpolate as interpolate_psd
 
 # ML Related
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-import time
-import random
-import requests
-from requests.exceptions import RequestException, HTTPError, Timeout, ConnectionError
-import glob
-
-# import matplotlib
-# matplotlib.use("Agg")
-# import matplotlib.pyplot as plt
-# import matplotlib as mpl
-
-# mpl.rcParams["text.usetex"] = False
-# mpl.rcParams["font.family"] = "serif"
-# mpl.rcParams["font.serif"] = ["DejaVu Serif"]
-
-
-# Go up 2 levels: New_version → Data_Generation 
-# PROJECT_ROOT = Path.cwd().parents[1]
-# sys.path.insert(0, str(PROJECT_ROOT))
-
 # Personal Modules
 from Training_Data_Generation.Simulation import SignalGenerator, GlitchGenerator
 # from Training_Data_Generation.Sampling import segment_lists
 # from Notching_Module import notch_bandpass_lines
+
+
 
 # AUXILIARY FUNCTIONS
 def zero_pad_timeseries(ts: TimeSeries, pad_seconds: float) -> TimeSeries:
@@ -81,26 +65,6 @@ def zero_pad_timeseries(ts: TimeSeries, pad_seconds: float) -> TimeSeries:
 def zero_like(ts: TimeSeries) -> TimeSeries:
     return TimeSeries(np.zeros(len(ts), dtype=ts.value.dtype), t0=ts.t0, dt=ts.dt, unit=ts.unit)
 
-
-# def scipy_bandpass_notch(ts, fs=4096, low=20, high=1700,
-#                          notches=(60, 120, 180, 300, 505, 600, 1000), q=30, order=4): 
-
-#     x = ts.value.astype(float)
-#     x = x - x.mean()  # important
-
-#     # bandpass as SOS
-#     sos = butter(order, [low, high], btype="bandpass", fs=fs, output="sos")
-
-#     # append notch SOS sections
-#     if notches is not None:
-#         for f0 in notches:
-#             b, a = iirnotch(w0=f0, Q=q, fs=fs)
-#             sos_notch = tf2sos(b, a)
-#             sos = np.vstack([sos, sos_notch])
-#     y = sosfiltfilt(sos, x)
-
-#     # preserve start time + sample spacing
-#     return TimeSeries(y, t0=ts.t0, dt=ts.dt, unit=ts.unit)
 
 @lru_cache(maxsize=32)
 def _cached_sos(fs, low, high, notches, q, order):
@@ -152,12 +116,49 @@ def gps_to_cyclical_time_features(gps_start: float, include_dow: bool = False) -
     return np.asarray(feats, dtype=np.float32)
 
 
+def optimal_snr_pycbc(ts, psd, f_low=20.0, f_high=1700):
+    """
+    Compute optimal SNR of a waveform using PyCBC's sigma().
+
+    Parameters
+    ----------
+    ts : gwpy.timeseries.TimeSeries
+        The waveform time series whose optimal SNR you want.
+    psd : gwpy.frequencyseries.FrequencySeries
+        PSD of the detector noise (NOT ASD).
+    f_low, f_high : float or None
+        Frequency cutoffs in Hz.
+
+    Returns
+    -------
+    float
+        Optimal SNR in that detector.
+    """
+    ts_pc = ts.to_pycbc(copy=False)
+    psd_pc = psd.to_pycbc(copy=False)
+
+    # sigma() needs matching delta_f; make waveform in frequency domain,
+    # then interpolate PSD if needed.
+    htilde = ts_pc.to_frequencyseries()
+    if (len(psd_pc) != len(htilde)) or (abs(float(psd_pc.delta_f) - float(htilde.delta_f)) > 0):
+        psd_pc = interpolate_psd(psd_pc, float(htilde.delta_f), length=len(htilde))
+
+    return float(
+        sigma(
+            htilde,
+            psd=psd_pc,
+            low_frequency_cutoff=f_low,
+            high_frequency_cutoff=f_high,
+        )
+    )
+
+
 def _to_fixed_spectrogram(qgram, out_f=256, out_t=256, log_eps=1e-12):
     """
     Convert gwpy QGram / Spectrogram-like object to a fixed-size torch.Tensor [F, T].
     """
     # gwpy spectrogram-like objects typically expose .value as a 2D numpy array
-    arr = np.asarray(qgram.value, dtype=np.float32)#.T #transpose!
+    arr = np.asarray(qgram.value, dtype=np.float32).T #transpose!
 
     arr = np.abs(arr)
     # log scaling (common for TF images)
@@ -216,8 +217,6 @@ def _build_sample_metadata_row(gps, example_seed, y, inj_meta):
         "y": int(y),
         "class_type": _CLASS_NAME_MAP[int(y)],
 
-        "final_snr": None,
-
         "chirp_mass": None,
         "merger_family": "",
         "approximant": "",
@@ -235,19 +234,20 @@ def _build_sample_metadata_row(gps, example_seed, y, inj_meta):
 
     if int(y) == 1:
         row.update({
-            "final_snr": _safe_float(inj_meta.get("final_snr")),
             "glitch_type": inj_meta.get("glitch_type", ""),
             "glitch_detector": inj_meta.get("detector", ""),
+            "rho_H1": _safe_float(inj_meta.get("rho_H1")),
+            "rho_L1": _safe_float(inj_meta.get("rho_L1")),
+            "rho_net": _safe_float(inj_meta.get("rho_net")),
         })
 
     elif int(y) == 2:
         row.update({
-            "final_snr": _safe_float(inj_meta.get("rho_net")),
             "chirp_mass": _safe_float(inj_meta.get("chirp_mass")),
             "merger_family": inj_meta.get("source_class", ""),
             "approximant": inj_meta.get("approximant", ""),
-            "rho_H1": _safe_float(inj_meta.get("rhoH")),
-            "rho_L1": _safe_float(inj_meta.get("rhoL")),
+            "rho_H1": _safe_float(inj_meta.get("rho_H1")),
+            "rho_L1": _safe_float(inj_meta.get("rho_L1")),
             "rho_net": _safe_float(inj_meta.get("rho_net")),
         })
 
@@ -272,6 +272,10 @@ class QTransformDataset(Dataset):
         seglen=8,
         sample_rate=4096,
         padding=30,
+        gw_snr_max=12,        
+        gw_snr_min=4,
+        glitch_snr_max=50,
+        glitch_snr_min=20,
         qrange=(3, 100),
         frange=(20, 300),
         out_f=256,
@@ -286,6 +290,11 @@ class QTransformDataset(Dataset):
         self.seglen = seglen
         self.sample_rate = sample_rate
         self.padding = padding
+
+        self.gw_snr_max = gw_snr_max
+        self.gw_snr_min = gw_snr_min
+        self.glitch_snr_max = glitch_snr_max
+        self.glitch_snr_min = glitch_snr_min
 
         self.qrange = qrange
         self.frange = frange
@@ -361,6 +370,7 @@ class QTransformDataset(Dataset):
 
         raise RuntimeError(f"Failed to fetch {ifo} at gps={gps} after {max_retries} retries") from last_err
 
+
     def _estimate_asd(self, ts: TimeSeries):
         return ts.asd(
             fftlength=self.seglen,
@@ -369,66 +379,13 @@ class QTransformDataset(Dataset):
             method="median",
         )
 
-    # def _make_injection(self, y: int, H1_noise, L1_noise, gps_H1: float, gps_L1: float, H1_asd, L1_asd, H1_dt, L1_dt, rng: np.random.Generator):
-    #     """
-    #     Deterministic injection using rng-derived seeds.
-    #     """
-    #     if y == 0:
-    #         # return zero_like(TimeSeries(np.zeros(len(H1_asd)*2 - 2), t0=gps_H1, dt=H1_dt)), \
-    #         #        zero_like(TimeSeries(np.zeros(len(L1_asd)*2 - 2), t0=gps_L1, dt=L1_dt))
-    #         H1_inj_pro = zero_like(H1_noise)
-    #         L1_inj_pro = zero_like(L1_noise)
-    #         return H1_inj_pro, L1_inj_pro
-
-    #     inj_seed = int(rng.integers(1, 2**31 - 1))
-
-    #     if y == 1:
-    #         g = GlitchGenerator(
-    #             sample_rate=self.sample_rate,
-    #             seglen=self.seglen,
-    #             snr_min=4,
-    #             snr_max=20,
-    #             snr_dist="loguniform",
-    #             seed=inj_seed,
-    #         )
-    #         H1_inj, L1_inj = g.generate(asd_H1=H1_asd, asd_L1=L1_asd, epoch=gps_H1)
-
-    #         # Force time alignment
-    #         H1_inj = TimeSeries(H1_inj.value*10, t0=gps_H1, dt=H1_dt)
-    #         L1_inj = TimeSeries(L1_inj.value*10, t0=gps_L1, dt=L1_dt)
-
-    #     elif y == 2:
-    #         s = SignalGenerator(
-    #             sample_rate=self.sample_rate,
-    #             seglen=self.seglen,
-    #             f_lower=20,
-    #             source_class=None,
-    #             snr_enabled=True,
-    #             veto_enabled=False,
-    #             seed=inj_seed,
-    #         )
-    #         H1_inj, L1_inj = s.generate(
-    #             epoch=gps_H1,
-    #             asd_H1=H1_asd,
-    #             asd_L1=L1_asd,
-    #             target_snr=None,      # let generator draw from snr_min..snr_max
-    #             coa_time=None,
-    #             return_metadata=False,
-    #         )
-
-    #         H1_inj = TimeSeries(H1_inj.value, t0=gps_H1, dt=H1_dt)
-    #         L1_inj = TimeSeries(L1_inj.value, t0=gps_L1, dt=L1_dt)
-
-    #     else:
-    #         raise ValueError(f"Unknown class y={y}")
-
-    #     H1_inj = zero_pad_timeseries(H1_inj, self.padding)
-    #     L1_inj = zero_pad_timeseries(L1_inj, self.padding)
-
-    #     H1_inj_pro = scipy_bandpass_notch(H1_inj.copy(), fs=self.sample_rate)
-    #     L1_inj_pro = scipy_bandpass_notch(L1_inj.copy(), fs=self.sample_rate)
-
-    #     return H1_inj_pro, L1_inj_pro
+    def _estimate_psd(self, ts: TimeSeries):
+        return ts.psd(
+            fftlength=self.seglen,
+            overlap=self.seglen / 2,
+            window="hann",
+            method="median",
+        )
 
     def _make_injection(
         self,
@@ -437,8 +394,8 @@ class QTransformDataset(Dataset):
         L1_noise,
         gps_H1: float,
         gps_L1: float,
-        H1_asd,
-        L1_asd,
+        H1_psd,
+        L1_psd,        
         H1_dt,
         L1_dt,
         rng: np.random.Generator,
@@ -447,7 +404,7 @@ class QTransformDataset(Dataset):
         """
         Deterministic injection using rng-derived seeds.
         """
-        inj_meta = None
+        inj_meta = {}
 
         if y == 0:
             H1_inj_pro = zero_like(H1_noise)
@@ -458,43 +415,33 @@ class QTransformDataset(Dataset):
 
             return H1_inj_pro, L1_inj_pro
 
+
         inj_seed = int(rng.integers(1, 2**31 - 1))
 
         if y == 1:
-            glitch_amp_boost = 10.0 
 
             g = GlitchGenerator(
                 sample_rate=self.sample_rate,
                 seglen=self.seglen,
-                snr_min=4,
-                snr_max=20,
-                snr_dist="loguniform",
                 seed=inj_seed,
             )
 
             if return_metadata:
                 H1_inj, L1_inj, inj_meta = g.generate(
-                    asd_H1=H1_asd,
-                    asd_L1=L1_asd,
                     epoch=gps_H1,
                     return_metadata=True,
                 )
             else:
                 H1_inj, L1_inj = g.generate(
-                    asd_H1=H1_asd,
-                    asd_L1=L1_asd,
                     epoch=gps_H1,
                 )
 
-            # Force time alignment + preserve your extra x10 glitch scaling
-            H1_inj = TimeSeries(H1_inj.value * glitch_amp_boost, t0=gps_H1, dt=H1_dt)
-            L1_inj = TimeSeries(L1_inj.value * glitch_amp_boost, t0=gps_L1, dt=L1_dt)
+            # Force time alignment
+            H1_inj = TimeSeries(H1_inj.value, t0=gps_H1, dt=H1_dt)
+            L1_inj = TimeSeries(L1_inj.value, t0=gps_L1, dt=L1_dt)
 
-            if return_metadata and inj_meta is not None:
-                if inj_meta.get("target_snr") is not None:
-                    inj_meta["target_snr"] = float(inj_meta["target_snr"]) * glitch_amp_boost
-                if inj_meta.get("final_snr") is not None:
-                    inj_meta["final_snr"] = float(inj_meta["final_snr"]) * glitch_amp_boost
+            target_snr = 10 ** rng.uniform(np.log10(self.glitch_snr_min), np.log10(self.glitch_snr_max)) # higher than GWs
+
 
         elif y == 2:
             s = SignalGenerator(
@@ -502,32 +449,25 @@ class QTransformDataset(Dataset):
                 seglen=self.seglen,
                 f_lower=20,
                 source_class=None,
-                snr_enabled=True,
-                veto_enabled=False,
                 seed=inj_seed,
             )
 
             if return_metadata:
                 H1_inj, L1_inj, inj_meta = s.generate(
                     epoch=gps_H1,
-                    asd_H1=H1_asd,
-                    asd_L1=L1_asd,
-                    target_snr=None,
                     coa_time=None,
                     return_metadata=True,
                 )
             else:
                 H1_inj, L1_inj = s.generate(
                     epoch=gps_H1,
-                    asd_H1=H1_asd,
-                    asd_L1=L1_asd,
-                    target_snr=None,
                     coa_time=None,
                     return_metadata=False,  # we can ignore this if not needed
                 )
 
             H1_inj = TimeSeries(H1_inj.value, t0=gps_H1, dt=H1_dt)
             L1_inj = TimeSeries(L1_inj.value, t0=gps_L1, dt=L1_dt)
+            target_snr = 10 ** rng.uniform(np.log10(self.gw_snr_min), np.log10(self.gw_snr_max))
 
         else:
             raise ValueError(f"Unknown class y={y}")
@@ -538,10 +478,63 @@ class QTransformDataset(Dataset):
         H1_inj_pro = scipy_bandpass_notch(H1_inj.copy(), fs=self.sample_rate)
         L1_inj_pro = scipy_bandpass_notch(L1_inj.copy(), fs=self.sample_rate)
 
+        # SNR Stuff
+        if y == 0:
+            scale = 1
+        else:
+            H1_inj_snr = H1_inj_pro.crop(gps_H1, gps_H1 + self.seglen)
+            L1_inj_snr = L1_inj_pro.crop(gps_L1, gps_L1 + self.seglen)
+
+            rhoH0 = optimal_snr_pycbc(H1_inj_snr, H1_psd, f_low=20.0, f_high=1700.0)
+            rhoL0 = optimal_snr_pycbc(L1_inj_snr, L1_psd, f_low=20.0, f_high=1700.0)
+            rho_net0 = np.hypot(rhoH0, rhoL0)
+
+            # If antenna pattern results in GW = 0, resample
+            if (not np.isfinite(rho_net0)) or (rho_net0 <= 1e-12):
+                print(f"[resample] gps={gps_H1}, rho_net0={rho_net0}, y={y}")
+
+                H1_inj_pro, L1_inj_pro, inj_meta = self._make_injection(
+                    y=y,
+                    H1_noise=H1_noise,
+                    L1_noise=L1_noise,
+                    gps_H1=gps_H1,
+                    gps_L1=gps_L1,
+                    H1_psd=H1_psd,
+                    L1_psd=L1_psd,                
+                    H1_dt=H1_dt,
+                    L1_dt=L1_dt,
+                    rng=rng + 1,
+                    return_metadata=True)
+                if return_metadata:
+                    return H1_inj_pro, L1_inj_pro, inj_meta
+                else:
+                    return H1_inj_pro, L1_inj_pro
+
+
+
+                return #FINISH
+
+            scale = target_snr / rho_net0
+
+        # Scale the FULL processed padded injection, since that's what gets added
+        H1_inj_pro = H1_inj_pro * scale
+        L1_inj_pro = L1_inj_pro * scale
+
+
         if return_metadata:
+
+            rhoH = optimal_snr_pycbc(H1_inj_pro.crop(gps_H1, gps_H1 + self.seglen), H1_psd, f_low=20.0, f_high=1700.0)
+            rhoL = optimal_snr_pycbc(L1_inj_pro.crop(gps_L1, gps_L1 + self.seglen), L1_psd, f_low=20.0, f_high=1700.0)
+            rho_net = np.hypot(rhoH, rhoL)
+
+            inj_meta["rho_H1"] = float(rhoH)
+            inj_meta["rho_L1"] = float(rhoL)
+            inj_meta["rho_net"] = float(rho_net)
+
             return H1_inj_pro, L1_inj_pro, inj_meta
 
         return H1_inj_pro, L1_inj_pro
+
 
     def __getitem__(self, idx: int):
         row = self.segment_df.iloc[idx]
@@ -565,6 +558,9 @@ class QTransformDataset(Dataset):
         H1_asd = self._estimate_asd(H1_processed)
         L1_asd = self._estimate_asd(L1_processed)
 
+        H1_psd = self._estimate_psd(H1_processed)
+        L1_psd = self._estimate_psd(L1_processed)
+
         need_meta = self.return_metadata or self.metadata_only
 
         if need_meta:
@@ -574,8 +570,8 @@ class QTransformDataset(Dataset):
                 L1_noise=L1_processed,
                 gps_H1=gps_H1,
                 gps_L1=gps_L1,
-                H1_asd=H1_asd,
-                L1_asd=L1_asd,
+                H1_psd=H1_psd,
+                L1_psd=L1_psd,                
                 H1_dt=H1_processed.dt,
                 L1_dt=L1_processed.dt,
                 rng=rng,
@@ -588,8 +584,8 @@ class QTransformDataset(Dataset):
                 L1_noise=L1_processed,
                 gps_H1=gps_H1,
                 gps_L1=gps_L1,
-                H1_asd=H1_asd,
-                L1_asd=L1_asd,
+                H1_psd=H1_psd,
+                L1_psd=L1_psd,                 
                 H1_dt=H1_processed.dt,
                 L1_dt=L1_processed.dt,
                 rng=rng,
@@ -605,6 +601,7 @@ class QTransformDataset(Dataset):
                 inj_meta=inj_meta,
             )
             return json.dumps(meta_row, separators=(",", ":"))
+
 
         H1_strain = H1_processed + H1_inj_pro
         L1_strain = L1_processed + L1_inj_pro
@@ -901,83 +898,6 @@ class PrecomputedPTShardDataset(Dataset):
         return X, t_feat, y
 
 
-# def write_split_metadata_csv(
-#     segment_df: pd.DataFrame,
-#     out_csv: str,
-#     *,
-#     batch_size: int = 64,
-#     num_workers: int = 4,
-#     cache: bool = True,
-#     loader_seed: int = 2026,
-#     seglen: int = 8,
-#     sample_rate: int = 4096,
-#     padding: int = 30,
-#     qrange=(3, 100),
-#     frange=(20, 300),
-#     out_f: int = 256,
-#     out_t: int = 256,
-# ):
-#     """
-#     Build a sidecar CSV for one split (typically TEST only), using the same
-#     deterministic GPS/example_seed/y rows as the main dataset.
-
-#     Output columns:
-#       GPS, example_seed, y, class_type, final_snr, chirp_mass,
-#       merger_family, approximant, rho_H1, rho_L1, rho_net,
-#       glitch_type, glitch_detector, sample_index
-#     """
-#     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-#     if os.path.exists(out_csv):
-#         os.remove(out_csv)
-
-#     ds = QTransformDataset(
-#         segment_df=segment_df,
-#         seglen=seglen,
-#         sample_rate=sample_rate,
-#         padding=padding,
-#         qrange=qrange,
-#         frange=frange,
-#         out_f=out_f,
-#         out_t=out_t,
-#         cache=cache,
-#         return_metadata=False,
-#         metadata_only=True,
-#     )
-
-#     g = torch.Generator()
-#     g.manual_seed(loader_seed)
-
-#     loader = DataLoader(
-#         ds,
-#         batch_size=batch_size,
-#         shuffle=False,   # keep same order as segment_df / test CSV
-#         drop_last=False,
-#         num_workers=num_workers,
-#         pin_memory=False,
-#         persistent_workers=(num_workers > 0),
-#         prefetch_factor=2 if num_workers > 0 else None,
-#         generator=g,
-#     )
-
-#     wrote_header = False
-#     sample_index = 0
-
-#     for meta_json_batch in loader:
-#         rows = [json.loads(s) for s in meta_json_batch]
-
-#         for r in rows:
-#             r["sample_index"] = sample_index
-#             sample_index += 1
-
-#         pd.DataFrame(rows).to_csv(
-#             out_csv,
-#             mode="a",
-#             header=(not wrote_header),
-#             index=False,
-#         )
-#         wrote_header = True
-
-#     return out_csv
 
 def write_split_metadata_csv(
     segment_df: pd.DataFrame,

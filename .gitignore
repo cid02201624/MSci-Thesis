@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# LIGO GW data (DO NOT COMMIT)
+*.hdf5
+*.h5
+*.gwf
+*.csv
+*.pt
+*.pbs
+*.png
+*.log
+*.out
+*.o18*
+*.o19*
+
+# Outputs
+outputs/
+Data_Generation/output/
+Data_Generation/data/
