@@ -1,0 +1,6 @@
+{
+  "signal_head_roc_auc": 0.9812261253665885,
+  "signal_head_average_precision": 0.9918460617642616,
+  "gw_head_on_signal_roc_auc": 0.9990498704500776,
+  "gw_head_on_signal_average_precision": 0.9992503406398585
+}
